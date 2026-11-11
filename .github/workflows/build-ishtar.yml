@@ -1,7 +1,9 @@
-# Like-for-like rebuild of the AlphaDroid 4.7 kernel for Xiaomi 13 Ultra (ishtar).
-# Source is pinned to the exact commit the running kernel was built from.
+# Kernel build for Xiaomi 13 Ultra (ishtar) on AlphaDroid 4.7.
+# Source is pinned to the exact commit the ROM's kernel was built from.
 # Output: an AnyKernel3 zip that replaces only the kernel Image in the boot partition.
-# The ROM's own modules (vendor_dlkm / vendor_boot) and init_boot are left untouched.
+# The ROM's own modules (vendor_dlkm / vendor_boot) and init_boot are left untouched,
+# so every change here must keep the module interface (symbol CRCs) identical to the
+# baseline build. The "ABI gate" step enforces that and fails the run otherwise.
 
 name: Build ishtar kernel
 
@@ -14,9 +16,18 @@ on:
         options:
           - thin
           - full
-        default: thin
+        default: full
+      bbr:
+        description: "Build in TCP BBR and make it the default congestion control"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: read
 
 env:
+  BASELINE_RUN_ID: "42991796427"
   KERNEL_REPO: ishtar-aosp/android_kernel_xiaomi_sm8550
   KERNEL_SHA: 34eaaccbb3d71edb8e03eb903d113e0e105b6237
   KERNEL_RELEASE: 5.15.211-g34eaaccbb3d7
@@ -37,7 +48,16 @@ jobs:
       - name: Free disk space
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
-          df -h /
+          df -h / /mnt || true
+
+      - name: Add swap (full LTO link needs more memory than the runner has)
+        run: |
+          sudo fallocate -l 16G /mnt/swap-lto || sudo fallocate -l 16G /swap-lto
+          f=/mnt/swap-lto; [ -f "$f" ] || f=/swap-lto
+          sudo chmod 600 "$f"
+          sudo mkswap "$f"
+          sudo swapon "$f"
+          free -h
 
       - name: Install build tools
         run: |
@@ -81,7 +101,15 @@ jobs:
           if [ "${{ inputs.lto }}" = "thin" ]; then
             scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN
           fi
+          if [ "${{ inputs.bbr }}" = "true" ]; then
+            scripts/config --file out/.config \
+              -e TCP_CONG_BBR -d DEFAULT_CUBIC -e DEFAULT_BBR \
+              --set-str DEFAULT_TCP_CONG bbr
+          fi
           make $MAKE_ARGS olddefconfig
+          if [ "${{ inputs.bbr }}" = "true" ]; then
+            grep -x 'CONFIG_DEFAULT_TCP_CONG="bbr"' out/.config
+          fi
           grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG_THIN|LTO_CLANG_FULL|MODVERSIONS|CFI_CLANG|DEBUG_INFO_BTF|MODULE_ALLOW_BTF_MISMATCH|TARGET_PRODUCT_ISHTAR|SCHED_WALT|HZ)=' out/.config
           cp out/.config "$GITHUB_WORKSPACE/kernel.config"
 
@@ -113,6 +141,31 @@ jobs:
             || cp out/Module.symvers "$GITHUB_WORKSPACE/vmlinux.symvers" 2>/dev/null \
             || echo "No symvers file found (not fatal)."
 
+      - name: Fetch baseline symbol table (build 1, verified on the phone)
+        uses: actions/download-artifact@v4
+        with:
+          name: build-records
+          path: baseline
+          run-id: ${{ env.BASELINE_RUN_ID }}
+          github-token: ${{ github.token }}
+
+      - name: ABI gate (exported symbols and CRCs must match the baseline)
+        run: |
+          # symvers columns: CRC, symbol, module, export type
+          awk '{print $2, $1}' baseline/vmlinux.symvers | sort > base.txt
+          awk '{print $2, $1}' vmlinux.symvers | sort > new.txt
+          echo "baseline symbols: $(wc -l < base.txt), new build: $(wc -l < new.txt)"
+          test "$(wc -l < base.txt)" -gt 1000
+          comm -23 base.txt new.txt > broken.txt
+          comm -13 base.txt new.txt > added.txt
+          echo "added or changed in new build: $(wc -l < added.txt)"
+          if [ -s broken.txt ]; then
+            echo "::error::$(wc -l < broken.txt) baseline symbols are missing or have a different CRC - the ROM's modules may not load. Do not flash."
+            head -n 50 broken.txt
+            exit 1
+          fi
+          echo "ABI gate passed: every baseline symbol is present with an identical CRC."
+
       - name: Package AnyKernel3 zip
         run: |
           git clone --depth 1 https://github.com/osm0sis/AnyKernel3 ak3
@@ -121,7 +174,7 @@ jobs:
           cat > anykernel.sh <<'EOF'
           ### AnyKernel3 script - Xiaomi 13 Ultra (ishtar), kernel Image only
           properties() { '
-          kernel.string=ishtar 5.15.211 rebuild (kernel Image only)
+          kernel.string=ishtar 5.15.211 custom build (kernel Image only)
           do.devicecheck=1
           do.modules=0
           do.systemless=0
