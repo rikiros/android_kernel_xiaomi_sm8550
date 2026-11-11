@@ -287,11 +287,19 @@ jobs:
           make $MAKE_ARGS INSTALL_MOD_PATH="$GITHUB_WORKSPACE/mods" INSTALL_MOD_STRIP=1 modules_install > /dev/null
           find "$GITHUB_WORKSPACE/mods" -name '*.ko' | wc -l
 
+      - name: Fetch this repo's module lists
+        if: inputs.modules
+        uses: actions/checkout@v4
+        with:
+          path: ishtar-ci
+          fetch-depth: 1
+          sparse-checkout: .github/ishtar
+
       - name: Module coverage report
         if: inputs.modules
         continue-on-error: true
         run: |
-          d="$GITHUB_WORKSPACE/.github/ishtar"
+          d="$GITHUB_WORKSPACE/ishtar-ci/.github/ishtar"
           norm() { sed 's/\.ko$//; s/-/_/g' | sort -u; }
           find mods -name '*.ko' -printf '%f\n' | norm > built.txt
           norm < "$d/modules.load.first_stage" > first_stage.txt
@@ -313,6 +321,7 @@ jobs:
             [ -n "$f" ] && cp "$f" first_stage_mods/
           done < "$d/modules.load.first_stage"
           ls first_stage_mods | wc -l
+          sed 's/^/BUILTMOD| /' built.txt
 
       - name: Upload first-stage modules (not flashable yet)
         if: inputs.modules
