@@ -27,12 +27,27 @@ on:
         type: boolean
         default: true
 
+      root:
+        description: "Built-in root: KernelSU-Next + SUSFS compiled into the kernel, or none (keep module-mode root)"
+        type: choice
+        options:
+          - ksun-susfs
+          - none
+        default: ksun-susfs
+
 permissions:
   contents: read
   actions: read
 
 env:
   BASELINE_RUN_ID: "42991796427"
+  # Build helpers (composite actions + fix-up scripts) for the KernelSU-Next / SUSFS
+  # integration. Pinned so a run is reproducible; SUSFS itself is fetched by those
+  # helpers from its android13-5.15 branch tip, and the commit used is in the log.
+  HELPERS_REPO: WildKernels/GKI_KernelSU_SUSFS
+  HELPERS_SHA: c6d44eb9110888ad0cbc8e172d0d64eaa7df3e1e
+  # pershoot/KernelSU-Next, branch dev-susfs (KernelSU-Next with SUSFS support)
+  KSUN_SHA: aafde92ae9769b42567d8db5feefd838c591633b
   PATCHES_REPO: WildKernels/kernel_patches
   PATCHES_SHA: b6690c6c66a05f873faf460daaaac1c84de9d720
   KERNEL_REPO: ishtar-aosp/android_kernel_xiaomi_sm8550
@@ -85,16 +100,22 @@ jobs:
           ld.lld --version
           pahole --version
 
+      - name: Fetch build helpers (pinned commit)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.HELPERS_REPO }}
+          ref: ${{ env.HELPERS_SHA }}
+          fetch-depth: 1
+
       - name: Fetch kernel source (pinned commit)
         uses: actions/checkout@v4
         with:
           repository: ${{ env.KERNEL_REPO }}
           ref: ${{ env.KERNEL_SHA }}
-          path: kernel
+          path: kernel/common
           fetch-depth: 1
 
       - name: Fetch patch set (pinned commit)
-        if: inputs.ntsync
         uses: actions/checkout@v4
         with:
           repository: ${{ env.PATCHES_REPO }}
@@ -104,14 +125,47 @@ jobs:
 
       - name: Apply NTSync driver backport (new files only, no core changes)
         if: inputs.ntsync
-        working-directory: kernel
+        working-directory: kernel/common
         run: |
           patch -p1 --forward < "$GITHUB_WORKSPACE/kernel_patches/common/ntsync/ntsync_compat_android13-5.15.patch"
           patch -p1 --forward < "$GITHUB_WORKSPACE/kernel_patches/common/ntsync/ntsync_base.patch"
           git status --short
 
+      - name: Set git identity (the SUSFS helper cherry-picks two commits)
+        run: |
+          git config --global user.name "ishtar-kernel-ci"
+          git config --global user.email "ci@users.noreply.github.com"
+
+      - name: Integrate KernelSU-Next (built in)
+        if: inputs.root == 'ksun-susfs'
+        uses: ./.github/actions/root-setup
+        with:
+          flavor: next
+          commit: ${{ env.KSUN_SHA }}
+
+      - name: Integrate SUSFS (built in)
+        if: inputs.root == 'ksun-susfs'
+        uses: ./.github/actions/susfs
+        with:
+          enabled: "true"
+          susfs_commit: ""
+          version: android13-5.15
+          android_version: android13
+          kernel_version: "5.15"
+          os_patch_level: "2026-09"
+          sublevel: "211"
+          root_flavor: next
+
+      - name: Show source changes made by the integrations
+        working-directory: kernel/common
+        run: |
+          git status --short | head -n 80
+          git diff --stat | tail -n 5
+          echo "--- root/SUSFS lines in gki_defconfig"
+          grep -E 'CONFIG_KSU' arch/arm64/configs/gki_defconfig || true
+
       - name: Configure (same recipe as the ROM device tree)
-        working-directory: kernel
+        working-directory: kernel/common
         run: |
           make $MAKE_ARGS gki_defconfig
           scripts/kconfig/merge_config.sh -m -O out out/.config \
@@ -150,25 +204,30 @@ jobs:
           if [ "${{ inputs.ntsync }}" = "true" ]; then
             grep -x 'CONFIG_NTSYNC=y' out/.config
           fi
+          if [ "${{ inputs.root }}" = "ksun-susfs" ]; then
+            grep -x 'CONFIG_KSU=y' out/.config
+            grep -x 'CONFIG_KSU_SUSFS=y' out/.config
+            grep -E '^CONFIG_KSU' out/.config
+          fi
           grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG_THIN|LTO_CLANG_FULL|MODVERSIONS|CFI_CLANG|DEBUG_INFO_BTF|MODULE_ALLOW_BTF_MISMATCH|TARGET_PRODUCT_ISHTAR|SCHED_WALT|HZ)=' out/.config
           cp out/.config "$GITHUB_WORKSPACE/kernel.config"
 
       - name: Print full config (for comparison with the phone's running config)
-        working-directory: kernel
+        working-directory: kernel/common
         run: |
           echo "::group::kernel config"
           grep -E '^(CONFIG_|# CONFIG_)' out/.config | sed 's/^/CFG| /'
           echo "::endgroup::"
 
       - name: Build kernel Image
-        working-directory: kernel
+        working-directory: kernel/common
         run: |
           set -o pipefail
           make -j"$(nproc)" $MAKE_ARGS Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 400
           ls -lh out/arch/arm64/boot/Image
 
       - name: Verify release string
-        working-directory: kernel
+        working-directory: kernel/common
         run: |
           strings out/arch/arm64/boot/Image > /tmp/image-strings.txt
           banner="$(grep -m1 '^Linux version [0-9]' /tmp/image-strings.txt || true)"
@@ -214,7 +273,7 @@ jobs:
           cat > anykernel.sh <<'EOF'
           ### AnyKernel3 script - Xiaomi 13 Ultra (ishtar), kernel Image only
           properties() { '
-          kernel.string=ishtar 5.15.211 custom build (kernel Image only)
+          kernel.string=ishtar 5.15.211 custom build (KernelSU-Next + SUSFS, kernel Image only)
           do.devicecheck=1
           do.modules=0
           do.systemless=0
@@ -240,7 +299,7 @@ jobs:
           split_boot;
           flash_boot;
           EOF
-          cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image" .
+          cp "$GITHUB_WORKSPACE/kernel/common/out/arch/arm64/boot/Image" .
           zip -r9 "$GITHUB_WORKSPACE/ishtar-kernel-AK3.zip" .
           ls -lh "$GITHUB_WORKSPACE/ishtar-kernel-AK3.zip"
 
