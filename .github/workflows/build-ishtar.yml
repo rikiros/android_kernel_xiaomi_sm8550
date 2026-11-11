@@ -93,6 +93,10 @@ jobs:
           scripts/kconfig/merge_config.sh -m -O out out/.config \
             arch/arm64/configs/vendor/kalama_GKI.config \
             arch/arm64/configs/vendor/ishtar_GKI.config
+          # Normalise the merged file first. The last fragment has no trailing
+          # newline, so anything scripts/config appends would be glued onto its
+          # final line and silently lost.
+          make $MAKE_ARGS olddefconfig
           # Build-only changes: none of these alter the module interface.
           scripts/config --file out/.config \
             -d WERROR \
