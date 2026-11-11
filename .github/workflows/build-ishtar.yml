@@ -27,6 +27,18 @@ on:
         type: boolean
         default: true
 
+      extras:
+        description: "futex_waitv syscall (Wine fsync), MGLRU on by default, NTFS3 driver"
+        type: boolean
+        default: true
+      mglru:
+        description: "Turn on the multi-gen LRU memory reclaim at boot (CONFIG_LRU_GEN_ENABLED)"
+        type: boolean
+        default: true
+      modules:
+        description: "Also build the in-tree vendor modules (dry run: checked and uploaded, not packaged)"
+        type: boolean
+        default: true
       root:
         description: "Built-in root: KernelSU-Next + SUSFS compiled into the kernel, or none (keep module-mode root)"
         type: choice
@@ -48,6 +60,9 @@ env:
   HELPERS_SHA: c6d44eb9110888ad0cbc8e172d0d64eaa7df3e1e
   # pershoot/KernelSU-Next, branch dev-susfs (KernelSU-Next with SUSFS support)
   KSUN_SHA: aafde92ae9769b42567d8db5feefd838c591633b
+  # futex_waitv backport for 5.15 (upstream since 5.16), from the linux-tkg patch set
+  TKG_REPO: Frogging-Family/linux-tkg
+  TKG_SHA: 8a0cd766bac5c59957208be92a8ad4538df8e971
   PATCHES_REPO: WildKernels/kernel_patches
   PATCHES_SHA: b6690c6c66a05f873faf460daaaac1c84de9d720
   KERNEL_REPO: ishtar-aosp/android_kernel_xiaomi_sm8550
@@ -131,6 +146,25 @@ jobs:
           patch -p1 --forward < "$GITHUB_WORKSPACE/kernel_patches/common/ntsync/ntsync_base.patch"
           git status --short
 
+      - name: Fetch futex_waitv backport (pinned commit)
+        if: inputs.extras
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TKG_REPO }}
+          ref: ${{ env.TKG_SHA }}
+          path: tkg
+          fetch-depth: 1
+          sparse-checkout: |
+            linux-tkg-patches/5.15
+          sparse-checkout-cone-mode: true
+
+      - name: Apply futex_waitv backport (new syscall 449, as upstream)
+        if: inputs.extras
+        working-directory: kernel/common
+        run: |
+          patch -p1 --forward < "$GITHUB_WORKSPACE/tkg/linux-tkg-patches/5.15/0007-v5.15-futex_waitv.patch"
+          grep -n 'futex_waitv' include/uapi/asm-generic/unistd.h
+
       - name: Set git identity (the SUSFS helper cherry-picks two commits)
         run: |
           git config --global user.name "ishtar-kernel-ci"
@@ -192,6 +226,12 @@ jobs:
           if [ "${{ inputs.ntsync }}" = "true" ]; then
             scripts/config --file out/.config -e NTSYNC
           fi
+          if [ "${{ inputs.mglru }}" = "true" ]; then
+            scripts/config --file out/.config -e LRU_GEN_ENABLED
+          fi
+          if [ "${{ inputs.extras }}" = "true" ]; then
+            scripts/config --file out/.config -e LRU_GEN_ENABLED -e NTFS3_FS
+          fi
           echo "--- TCP options before olddefconfig"
           grep -E 'CONFIG_(TCP_CONG_|DEFAULT_(BBR|CUBIC|RENO|TCP_CONG))' out/.config || true
           make $MAKE_ARGS olddefconfig
@@ -203,6 +243,13 @@ jobs:
           fi
           if [ "${{ inputs.ntsync }}" = "true" ]; then
             grep -x 'CONFIG_NTSYNC=y' out/.config
+          fi
+          if [ "${{ inputs.extras }}" = "true" ]; then
+            grep -x 'CONFIG_LRU_GEN_ENABLED=y' out/.config
+            grep -x 'CONFIG_NTFS3_FS=y' out/.config
+          fi
+          if [ "${{ inputs.mglru }}" = "true" ]; then
+            grep -x 'CONFIG_LRU_GEN_ENABLED=y' out/.config
           fi
           if [ "${{ inputs.root }}" = "ksun-susfs" ]; then
             grep -x 'CONFIG_KSU=y' out/.config
@@ -225,6 +272,55 @@ jobs:
           set -o pipefail
           make -j"$(nproc)" $MAKE_ARGS Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 400
           ls -lh out/arch/arm64/boot/Image
+          if [ "${{ inputs.extras }}" = "true" ]; then
+            grep -E ' (__arm64_sys_futex_waitv|sys_futex_waitv)$' out/System.map
+          fi
+
+      - name: Build in-tree vendor modules (dry run)
+        if: inputs.modules
+        continue-on-error: true
+        working-directory: kernel/common
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" $MAKE_ARGS modules 2>&1 | tail -n 60
+          rm -rf "$GITHUB_WORKSPACE/mods"
+          make $MAKE_ARGS INSTALL_MOD_PATH="$GITHUB_WORKSPACE/mods" INSTALL_MOD_STRIP=1 modules_install > /dev/null
+          find "$GITHUB_WORKSPACE/mods" -name '*.ko' | wc -l
+
+      - name: Module coverage report
+        if: inputs.modules
+        continue-on-error: true
+        run: |
+          d="$GITHUB_WORKSPACE/.github/ishtar"
+          norm() { sed 's/\.ko$//; s/-/_/g' | sort -u; }
+          find mods -name '*.ko' -printf '%f\n' | norm > built.txt
+          norm < "$d/modules.load.first_stage" > first_stage.txt
+          norm < "$d/modules.load.vendor_dlkm" > vendor_dlkm.txt
+          sort -u "$d/phone_loaded_modules.txt" > loaded.txt
+          echo "modules built from the kernel tree: $(wc -l < built.txt)"
+          echo "first-stage (vendor_boot) modules reproduced: $(comm -12 first_stage.txt built.txt | wc -l) of $(wc -l < first_stage.txt)"
+          echo "vendor_dlkm modules reproduced: $(comm -12 vendor_dlkm.txt built.txt | wc -l) of $(wc -l < vendor_dlkm.txt)"
+          echo "modules loaded on the phone reproduced: $(comm -12 loaded.txt built.txt | wc -l) of $(wc -l < loaded.txt)"
+          echo "--- first-stage modules NOT built from the kernel tree:"
+          comm -23 first_stage.txt built.txt
+          for m in sched-walt qcom-cpufreq-hw thermal_pause msm_lmh_dcvs; do
+            f="$(find mods -name "$m.ko" | head -n 1)"
+            [ -n "$f" ] && echo "$m: $(modinfo -F vermagic "$f")"
+          done
+          mkdir -p first_stage_mods
+          while read -r m; do
+            f="$(find mods -name "$m" | head -n 1)"
+            [ -n "$f" ] && cp "$f" first_stage_mods/
+          done < "$d/modules.load.first_stage"
+          ls first_stage_mods | wc -l
+
+      - name: Upload first-stage modules (not flashable yet)
+        if: inputs.modules
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: first-stage-modules
+          path: first_stage_mods/
 
       - name: Verify release string
         working-directory: kernel/common
@@ -273,7 +369,7 @@ jobs:
           cat > anykernel.sh <<'EOF'
           ### AnyKernel3 script - Xiaomi 13 Ultra (ishtar), kernel Image only
           properties() { '
-          kernel.string=ishtar 5.15.211 custom build (KernelSU-Next + SUSFS, kernel Image only)
+          kernel.string=ishtar 5.15.211 custom build (KernelSU-Next + SUSFS + MGLRU, kernel Image only)
           do.devicecheck=1
           do.modules=0
           do.systemless=0
