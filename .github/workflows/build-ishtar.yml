@@ -103,8 +103,9 @@ jobs:
           fi
           if [ "${{ inputs.bbr }}" = "true" ]; then
             scripts/config --file out/.config \
-              -e TCP_CONG_BBR -d DEFAULT_CUBIC -e DEFAULT_BBR \
-              --set-str DEFAULT_TCP_CONG bbr
+              -e TCP_CONG_ADVANCED -e TCP_CONG_CUBIC -e TCP_CONG_BBR \
+              -d TCP_CONG_BIC -d TCP_CONG_WESTWOOD -d TCP_CONG_HTCP \
+              -d DEFAULT_CUBIC -e DEFAULT_BBR
           fi
           make $MAKE_ARGS olddefconfig
           if [ "${{ inputs.bbr }}" = "true" ]; then
