@@ -85,6 +85,13 @@ jobs:
           grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG_THIN|LTO_CLANG_FULL|MODVERSIONS|CFI_CLANG|DEBUG_INFO_BTF|MODULE_ALLOW_BTF_MISMATCH|TARGET_PRODUCT_ISHTAR|SCHED_WALT|HZ)=' out/.config
           cp out/.config "$GITHUB_WORKSPACE/kernel.config"
 
+      - name: Print full config (for comparison with the phone's running config)
+        working-directory: kernel
+        run: |
+          echo "::group::kernel config"
+          grep -E '^(CONFIG_|# CONFIG_)' out/.config | sed 's/^/CFG| /'
+          echo "::endgroup::"
+
       - name: Build kernel Image
         working-directory: kernel
         run: |
@@ -96,7 +103,7 @@ jobs:
         working-directory: kernel
         run: |
           strings out/arch/arm64/boot/Image > /tmp/image-strings.txt
-          banner="$(grep -m1 '^Linux version ' /tmp/image-strings.txt || true)"
+          banner="$(grep -m1 '^Linux version [0-9]' /tmp/image-strings.txt || true)"
           echo "$banner"
           case "$banner" in
             "Linux version $KERNEL_RELEASE "*) echo "Release string matches the running kernel." ;;
