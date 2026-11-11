@@ -1,0 +1,162 @@
+# Like-for-like rebuild of the AlphaDroid 4.7 kernel for Xiaomi 13 Ultra (ishtar).
+# Source is pinned to the exact commit the running kernel was built from.
+# Output: an AnyKernel3 zip that replaces only the kernel Image in the boot partition.
+# The ROM's own modules (vendor_dlkm / vendor_boot) and init_boot are left untouched.
+
+name: Build ishtar kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      lto:
+        description: "LTO mode (thin = faster, safer on memory; full = same as the ROM build)"
+        type: choice
+        options:
+          - thin
+          - full
+        default: thin
+
+env:
+  KERNEL_REPO: ishtar-aosp/android_kernel_xiaomi_sm8550
+  KERNEL_SHA: 34eaaccbb3d71edb8e03eb903d113e0e105b6237
+  KERNEL_RELEASE: 5.15.211-g34eaaccbb3d7
+  LOCALVER: -g34eaaccbb3d7
+  MAKE_ARGS: O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 LOCALVERSION=
+  KBUILD_BUILD_USER: build
+  KBUILD_BUILD_HOST: github
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex cpio kmod zip xz-utils python3 wget gnupg \
+            lsb-release software-properties-common \
+            libssl-dev libelf-dev dwarves
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 21
+          sudo apt-get install -y --no-install-recommends clang-21 lld-21 llvm-21
+          echo "/usr/lib/llvm-21/bin" >> "$GITHUB_PATH"
+
+      - name: Show tool versions
+        run: |
+          clang --version
+          ld.lld --version
+          pahole --version
+
+      - name: Fetch kernel source (pinned commit)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_SHA }}
+          path: kernel
+          fetch-depth: 1
+
+      - name: Configure (same recipe as the ROM device tree)
+        working-directory: kernel
+        run: |
+          make $MAKE_ARGS gki_defconfig
+          scripts/kconfig/merge_config.sh -m -O out out/.config \
+            arch/arm64/configs/vendor/kalama_GKI.config \
+            arch/arm64/configs/vendor/ishtar_GKI.config
+          # Build-only changes: none of these alter the module interface.
+          scripts/config --file out/.config \
+            -d WERROR \
+            -d LOCALVERSION_AUTO \
+            --set-str LOCALVERSION "$LOCALVER"
+          if [ "${{ inputs.lto }}" = "thin" ]; then
+            scripts/config --file out/.config -d LTO_CLANG_FULL -e LTO_CLANG_THIN
+          fi
+          make $MAKE_ARGS olddefconfig
+          grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG_THIN|LTO_CLANG_FULL|MODVERSIONS|CFI_CLANG|DEBUG_INFO_BTF|MODULE_ALLOW_BTF_MISMATCH|TARGET_PRODUCT_ISHTAR|SCHED_WALT|HZ)=' out/.config
+          cp out/.config "$GITHUB_WORKSPACE/kernel.config"
+
+      - name: Build kernel Image
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          make -j"$(nproc)" $MAKE_ARGS Image 2>&1 | tee "$GITHUB_WORKSPACE/build.log" | tail -n 400
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Verify release string
+        working-directory: kernel
+        run: |
+          strings out/arch/arm64/boot/Image > /tmp/image-strings.txt
+          banner="$(grep -m1 '^Linux version ' /tmp/image-strings.txt || true)"
+          echo "$banner"
+          case "$banner" in
+            "Linux version $KERNEL_RELEASE "*) echo "Release string matches the running kernel." ;;
+            *) echo "::error::Release string differs from $KERNEL_RELEASE - do not flash."; exit 1 ;;
+          esac
+          cp out/vmlinux.symvers "$GITHUB_WORKSPACE/vmlinux.symvers" 2>/dev/null \
+            || cp out/Module.symvers "$GITHUB_WORKSPACE/vmlinux.symvers" 2>/dev/null \
+            || echo "No symvers file found (not fatal)."
+
+      - name: Package AnyKernel3 zip
+        run: |
+          git clone --depth 1 https://github.com/osm0sis/AnyKernel3 ak3
+          cd ak3
+          rm -rf .git .github README.md
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 script - Xiaomi 13 Ultra (ishtar), kernel Image only
+          properties() { '
+          kernel.string=ishtar 5.15.211 rebuild (kernel Image only)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=ishtar
+          device.name2=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          # boot shell variables
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          # import functions/variables and setup patching (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # boot install: replace the kernel, keep everything else as it is
+          split_boot;
+          flash_boot;
+          EOF
+          cp "$GITHUB_WORKSPACE/kernel/out/arch/arm64/boot/Image" .
+          zip -r9 "$GITHUB_WORKSPACE/ishtar-kernel-AK3.zip" .
+          ls -lh "$GITHUB_WORKSPACE/ishtar-kernel-AK3.zip"
+
+      - name: Upload flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ishtar-kernel-AK3
+          path: ishtar-kernel-AK3.zip
+
+      - name: Upload build records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-records
+          path: |
+            kernel.config
+            vmlinux.symvers
+            build.log
+          if-no-files-found: ignore
