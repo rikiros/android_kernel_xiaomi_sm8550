@@ -22,12 +22,19 @@ on:
         type: boolean
         default: true
 
+      ntsync:
+        description: "Add the NT synchronization driver (/dev/ntsync) used by Wine-based gaming"
+        type: boolean
+        default: true
+
 permissions:
   contents: read
   actions: read
 
 env:
   BASELINE_RUN_ID: "42991796427"
+  PATCHES_REPO: WildKernels/kernel_patches
+  PATCHES_SHA: b6690c6c66a05f873faf460daaaac1c84de9d720
   KERNEL_REPO: ishtar-aosp/android_kernel_xiaomi_sm8550
   KERNEL_SHA: 34eaaccbb3d71edb8e03eb903d113e0e105b6237
   KERNEL_RELEASE: 5.15.211-g34eaaccbb3d7
@@ -86,6 +93,23 @@ jobs:
           path: kernel
           fetch-depth: 1
 
+      - name: Fetch patch set (pinned commit)
+        if: inputs.ntsync
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PATCHES_REPO }}
+          ref: ${{ env.PATCHES_SHA }}
+          path: kernel_patches
+          fetch-depth: 1
+
+      - name: Apply NTSync driver backport (new files only, no core changes)
+        if: inputs.ntsync
+        working-directory: kernel
+        run: |
+          patch -p1 --forward < "$GITHUB_WORKSPACE/kernel_patches/common/ntsync/ntsync_compat_android13-5.15.patch"
+          patch -p1 --forward < "$GITHUB_WORKSPACE/kernel_patches/common/ntsync/ntsync_base.patch"
+          git status --short
+
       - name: Configure (same recipe as the ROM device tree)
         working-directory: kernel
         run: |
@@ -111,6 +135,9 @@ jobs:
               -d TCP_CONG_BIC -d TCP_CONG_WESTWOOD -d TCP_CONG_HTCP \
               -d DEFAULT_CUBIC -e DEFAULT_BBR
           fi
+          if [ "${{ inputs.ntsync }}" = "true" ]; then
+            scripts/config --file out/.config -e NTSYNC
+          fi
           echo "--- TCP options before olddefconfig"
           grep -E 'CONFIG_(TCP_CONG_|DEFAULT_(BBR|CUBIC|RENO|TCP_CONG))' out/.config || true
           make $MAKE_ARGS olddefconfig
@@ -119,6 +146,9 @@ jobs:
           if [ "${{ inputs.bbr }}" = "true" ]; then
             grep -x 'CONFIG_TCP_CONG_BBR=y' out/.config
             grep -x 'CONFIG_DEFAULT_TCP_CONG="bbr"' out/.config
+          fi
+          if [ "${{ inputs.ntsync }}" = "true" ]; then
+            grep -x 'CONFIG_NTSYNC=y' out/.config
           fi
           grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG_THIN|LTO_CLANG_FULL|MODVERSIONS|CFI_CLANG|DEBUG_INFO_BTF|MODULE_ALLOW_BTF_MISMATCH|TARGET_PRODUCT_ISHTAR|SCHED_WALT|HZ)=' out/.config
           cp out/.config "$GITHUB_WORKSPACE/kernel.config"
