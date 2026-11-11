@@ -107,8 +107,13 @@ jobs:
               -d TCP_CONG_BIC -d TCP_CONG_WESTWOOD -d TCP_CONG_HTCP \
               -d DEFAULT_CUBIC -e DEFAULT_BBR
           fi
+          echo "--- TCP options before olddefconfig"
+          grep -E 'CONFIG_(TCP_CONG_|DEFAULT_(BBR|CUBIC|RENO|TCP_CONG))' out/.config || true
           make $MAKE_ARGS olddefconfig
+          echo "--- TCP options after olddefconfig"
+          grep -E 'CONFIG_(TCP_CONG_|DEFAULT_(BBR|CUBIC|RENO|TCP_CONG))' out/.config || true
           if [ "${{ inputs.bbr }}" = "true" ]; then
+            grep -x 'CONFIG_TCP_CONG_BBR=y' out/.config
             grep -x 'CONFIG_DEFAULT_TCP_CONG="bbr"' out/.config
           fi
           grep -E '^CONFIG_(LOCALVERSION|LTO_CLANG_THIN|LTO_CLANG_FULL|MODVERSIONS|CFI_CLANG|DEBUG_INFO_BTF|MODULE_ALLOW_BTF_MISMATCH|TARGET_PRODUCT_ISHTAR|SCHED_WALT|HZ)=' out/.config
