@@ -38,11 +38,11 @@ on:
       modules:
         description: "Also build the in-tree vendor modules (dry run: checked and uploaded, not packaged)"
         type: boolean
-        default: true
+        default: false
       vboot:
         description: "Also make a zip that swaps the 102 first-stage modules inside vendor_boot (needs modules)"
         type: boolean
-        default: true
+        default: false
       root:
         description: "Built-in root: KernelSU-Next + SUSFS compiled into the kernel, or none (keep module-mode root)"
         type: choice
