@@ -39,6 +39,10 @@ on:
         description: "Also build the in-tree vendor modules (dry run: checked and uploaded, not packaged)"
         type: boolean
         default: true
+      vboot:
+        description: "Also make a zip that swaps the 102 first-stage modules inside vendor_boot (needs modules)"
+        type: boolean
+        default: true
       root:
         description: "Built-in root: KernelSU-Next + SUSFS compiled into the kernel, or none (keep module-mode root)"
         type: choice
@@ -323,6 +327,26 @@ jobs:
           ls first_stage_mods | wc -l
           sed 's/^/BUILTMOD| /' built.txt
 
+      - name: Module CRC gate (symbols the phone's unchanged modules import)
+        if: inputs.vboot
+        run: |
+          v="$GITHUB_WORKSPACE/ishtar-ci/.github/ishtar/vdlkm_versions.txt"
+          [ -s "$v" ] || { echo "::error::$v missing - collect it from the phone first"; exit 1; }
+          test "$(ls first_stage_mods/*.ko | wc -l)" -eq 102
+          # our build: symbol -> CRC, for every export (kernel and modules)
+          awk '{print $2, tolower($1)}' kernel/common/out/Module.symvers | sort -u > ours.txt
+          # phone: symbols imported by its vendor_dlkm modules, with the CRC they expect
+          awk 'NF==3 {print $2, tolower($3)}' "$v" | sort -u > want.txt
+          join want.txt ours.txt | awk '$2 != $3' > mismatch.txt
+          echo "imports checked: $(wc -l < want.txt); found in our build: $(join want.txt ours.txt | wc -l)"
+          echo "CRC mismatches: $(wc -l < mismatch.txt)"
+          if [ -s mismatch.txt ]; then
+            head -n 40 mismatch.txt
+            echo "::error::The phone's vendor_dlkm modules expect different CRCs - the vendor_boot zip would break them."
+            exit 1
+          fi
+          echo "CRC gate passed: every import the phone's modules expect matches this build."
+
       - name: Upload first-stage modules (not flashable yet)
         if: inputs.modules
         continue-on-error: true
@@ -407,6 +431,91 @@ jobs:
           cp "$GITHUB_WORKSPACE/kernel/common/out/arch/arm64/boot/Image" .
           zip -r9 "$GITHUB_WORKSPACE/ishtar-kernel-AK3.zip" .
           ls -lh "$GITHUB_WORKSPACE/ishtar-kernel-AK3.zip"
+
+      - name: Package kernel + vendor_boot modules zip
+        if: inputs.vboot
+        run: |
+          rm -rf ak3v && cp -a ak3 ak3v && cd ak3v
+          rm -f Image ishtar-kernel-AK3.zip anykernel.sh
+          mkdir -p kimg vbmods
+          cp "$GITHUB_WORKSPACE/kernel/common/out/arch/arm64/boot/Image" kimg/
+          cp "$GITHUB_WORKSPACE"/first_stage_mods/*.ko vbmods/
+          test "$(ls vbmods/*.ko | wc -l)" -eq 102
+          cat > anykernel.sh <<'EOF'
+          ### AnyKernel3 script - Xiaomi 13 Ultra (ishtar)
+          ### kernel Image + the 102 first-stage modules inside vendor_boot
+          properties() { '
+          kernel.string=ishtar 5.15.211 custom build (kernel + vendor_boot modules)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=ishtar
+          device.name2=
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+          ## 1) vendor_boot: unpack and check every module before anything is written
+          BLOCK=vendor_boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          . tools/ak3-core.sh;
+
+          dump_boot;
+
+          field() { tr '\000' '\n' < "$1" | grep -m1 "^$2="; }
+          checked=0;
+          for m in $AKHOME/vbmods/*.ko; do
+            name=$(basename $m);
+            hits=0;
+            for t in $VENDORRD/*/lib/modules/$name; do
+              [ -f "$t" ] || continue;
+              hits=$((hits+1));
+              [ "$(field $m vermagic)" == "$(field $t vermagic)" ] || abort "vermagic differs for $name. Nothing was flashed.";
+              [ "$(field $m depends)" == "$(field $t depends)" ] || abort "dependencies differ for $name. Nothing was flashed.";
+            done;
+            [ $hits -gt 0 ] || abort "$name not found in vendor_boot. Nothing was flashed.";
+            checked=$((checked+1));
+          done;
+          [ $checked -eq 102 ] || abort "Expected 102 modules, checked $checked. Nothing was flashed.";
+          ui_print "All 102 modules match vendor_boot (vermagic and dependencies).";
+
+          replaced=0;
+          for m in $AKHOME/vbmods/*.ko; do
+            for t in $VENDORRD/*/lib/modules/$(basename $m); do
+              [ -f "$t" ] && cp -f $m $t && replaced=$((replaced+1));
+            done;
+          done;
+          ui_print "Replaced $replaced module file(s) in vendor_boot.";
+
+          write_boot;
+
+          ## 2) boot: replace the kernel Image, keep everything else
+          mv -f $AKHOME/kimg/Image $AKHOME/Image;
+          BLOCK=boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          reset_ak;
+
+          split_boot;
+          flash_boot;
+          EOF
+          sed -i 's/^          //' anykernel.sh
+          bash -n anykernel.sh
+          zip -r9 "$GITHUB_WORKSPACE/ishtar-kernel-vboot-AK3.zip" . -x '*.git*'
+          ls -lh "$GITHUB_WORKSPACE/ishtar-kernel-vboot-AK3.zip"
+
+      - name: Upload kernel + vendor_boot modules zip
+        if: inputs.vboot
+        uses: actions/upload-artifact@v4
+        with:
+          name: ishtar-kernel-vboot-AK3
+          path: ishtar-kernel-vboot-AK3.zip
 
       - name: Upload flashable zip
         uses: actions/upload-artifact@v4
