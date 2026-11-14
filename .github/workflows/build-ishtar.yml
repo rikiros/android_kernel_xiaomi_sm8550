@@ -281,7 +281,9 @@ jobs:
       - name: Fail on rejected patch hunks
         working-directory: kernel/common
         run: |
-          rej="$(find . -name '*.rej' -not -path './out/*' | head -n 20)"
+          # ignore .rej files that are part of the source tree itself
+          rej="$(find . -name '*.rej' -not -path './out/*' | while read -r f; do
+                   git ls-files --error-unmatch "$f" >/dev/null 2>&1 || echo "$f"; done | head -n 20)"
           if [ -n "$rej" ]; then
             echo "::error::Some patch hunks were rejected:"; echo "$rej"; exit 1
           fi
