@@ -1,0 +1,57 @@
+# Turns the kernel Image from an earlier build run into a fastboot-flashable
+# boot.img (boot image header v4, kernel only - the same layout as Google's GKI
+# boot image used by Neoteric OS and HyperOS on ishtar; the generic ramdisk lives
+# in init_boot and the vendor ramdisk in vendor_boot, both left untouched).
+# Use it when the phone has no root, so Kernel Flasher cannot be used.
+
+name: Make fastboot boot.img
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Build run whose ishtar-kernel-AK3 artifact holds the kernel Image"
+        required: true
+        default: "43123447256"
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  bootimg:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch kernel zip from the build run
+        uses: actions/download-artifact@v4
+        with:
+          name: ishtar-kernel-AK3
+          path: in
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Extract Image
+        run: |
+          cd in
+          unzip -o -q ishtar-kernel-AK3.zip Image
+          ls -l Image
+          strings Image | grep -m1 '^Linux version [0-9]'
+
+      - name: Fetch AOSP mkbootimg tools
+        run: git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg
+
+      - name: Build boot.img (header v4, kernel only)
+        run: |
+          python3 mkbootimg/mkbootimg.py --header_version 4 --kernel in/Image --output ishtar-boot.img
+          python3 mkbootimg/unpack_bootimg.py --boot_img ishtar-boot.img --out unpacked
+          ls -l ishtar-boot.img unpacked
+          cmp in/Image unpacked/kernel && echo "kernel inside boot.img is identical to the build's Image"
+          sha256sum ishtar-boot.img | tee ishtar-boot.img.sha256
+
+      - name: Upload boot.img
+        uses: actions/upload-artifact@v4
+        with:
+          name: ishtar-boot-img
+          path: |
+            ishtar-boot.img
+            ishtar-boot.img.sha256
