@@ -43,6 +43,14 @@ on:
         description: "Also make a zip that swaps the 102 first-stage modules inside vendor_boot (needs modules)"
         type: boolean
         default: false
+      wild:
+        description: "Wild Kernels feature set: SUSFS ptrace + unicode fixes, Baseband Guard, BBRv3, IP sets/firewall/qdisc/TTL, CIFS, tmpfs xattr/ACL, fanotify"
+        type: boolean
+        default: true
+      wild_extra:
+        description: "Also NoMount VFS hooks and DroidSpaces container support (more invasive)"
+        type: boolean
+        default: false
       root:
         description: "Built-in root: KernelSU-Next + SUSFS compiled into the kernel, or none (keep module-mode root)"
         type: choice
@@ -67,6 +75,11 @@ env:
   # futex_waitv backport for 5.15 (upstream since 5.16), from the linux-tkg patch set
   TKG_REPO: Frogging-Family/linux-tkg
   TKG_SHA: 8a0cd766bac5c59957208be92a8ad4538df8e971
+  # Baseband Guard (vc-teahouse/Baseband-guard), NoMount (maxsteeel/nomount, dev),
+  # DroidSpaces (ravindu644/Droidspaces-OSS) - all pinned
+  BBG_SHA: 028ff7fd509e2104596da7cc1ef8e6ce2a0c9082
+  NOMOUNT_SHA: 7914458ca71dfa3a8c162fa97fdb69332db7a690
+  DROIDSPACES_SHA: cdadb9eb5d0f86aacffff60776333e6f6b73a30a
   PATCHES_REPO: WildKernels/kernel_patches
   PATCHES_SHA: b6690c6c66a05f873faf460daaaac1c84de9d720
   KERNEL_REPO: ishtar-aosp/android_kernel_xiaomi_sm8550
@@ -104,7 +117,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            bc bison flex cpio kmod zip xz-utils python3 wget gnupg \
+            bc bison flex cpio kmod zip xz-utils python3 wget gnupg gawk \
             lsb-release software-properties-common \
             libssl-dev libelf-dev dwarves
           wget -q https://apt.llvm.org/llvm.sh
@@ -194,6 +207,86 @@ jobs:
           sublevel: "211"
           root_flavor: next
 
+      - name: Baseband Guard - fetch pinned source and wire it into security/
+        if: inputs.wild
+        working-directory: kernel
+        run: |
+          git clone -q https://github.com/vc-teahouse/Baseband-guard Baseband-guard
+          git -C Baseband-guard checkout -q "$BBG_SHA"
+          test "$(git -C Baseband-guard rev-parse HEAD)" = "$BBG_SHA"
+          sh Baseband-guard/setup.sh "$BBG_SHA"
+          test "$(git -C Baseband-guard rev-parse HEAD)" = "$BBG_SHA"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/bbg_618_compat.py" common/security/baseband-guard
+          # add baseband_guard to the default LSM list (same edit the Wild build makes)
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' common/security/Kconfig
+          grep -n 'baseband' common/security/Kconfig common/security/Makefile
+
+      - name: Baseband Guard - enable
+        if: inputs.wild
+        uses: ./.github/actions/set-kernel-config
+        with:
+          config_list: |
+            CONFIG_BBG=y
+
+      - name: Networking set (IP sets, firewall targets, qdiscs, TTL, BBRv3, CIFS)
+        if: inputs.wild
+        uses: ./.github/actions/networking
+        with:
+          version: android13-5.15
+          kernel_version: "5.15"
+          android_version: android13
+          sublevel: "211"
+          os_patch_level: lts
+
+      - name: SUSFS companion fix - ptrace leak
+        if: inputs.wild && inputs.root == 'ksun-susfs'
+        uses: ./.github/actions/ptrace
+        with:
+          kernel_version: "5.15"
+
+      - name: SUSFS companion fix - unicode path bypass
+        if: inputs.wild && inputs.root == 'ksun-susfs'
+        uses: ./.github/actions/unicode-fix
+        with:
+          kernel_version: "5.15"
+
+      - name: Misc configs (tmpfs xattr/ACL, fanotify, overlayfs, kallsyms)
+        if: inputs.wild
+        uses: ./.github/actions/misc
+        with:
+          version: android13-5.15
+          kernel_version: "5.15"
+          android_version: android13
+          sublevel: "211"
+          variant: Normal
+
+      - name: DroidSpaces container support
+        if: inputs.wild_extra
+        uses: ./.github/actions/droidspaces
+        with:
+          version: android13-5.15
+          android_version: android13
+          kernel_version: "5.15"
+          os_patch_level: "2026-09"
+          sublevel: "211"
+          droidspaces_commit: ${{ env.DROIDSPACES_SHA }}
+
+      - name: NoMount VFS hooks
+        if: inputs.wild_extra
+        uses: ./.github/actions/nomount
+        with:
+          commit: ${{ env.NOMOUNT_SHA }}
+          kernel_version: "5.15"
+
+      - name: Fail on rejected patch hunks
+        working-directory: kernel/common
+        run: |
+          rej="$(find . -name '*.rej' -not -path './out/*' | head -n 20)"
+          if [ -n "$rej" ]; then
+            echo "::error::Some patch hunks were rejected:"; echo "$rej"; exit 1
+          fi
+          echo "No rejected hunks."
+
       - name: Show source changes made by the integrations
         working-directory: kernel/common
         run: |
@@ -236,6 +329,11 @@ jobs:
           if [ "${{ inputs.extras }}" = "true" ]; then
             scripts/config --file out/.config -e LRU_GEN_ENABLED -e NTFS3_FS
           fi
+          if [ "${{ inputs.wild }}" = "true" ]; then
+            # keep the extra congestion controls the networking set turned on
+            scripts/config --file out/.config \
+              -e TCP_CONG_BIC -e TCP_CONG_WESTWOOD -e TCP_CONG_HTCP -e TCP_CONG_BBR3
+          fi
           echo "--- TCP options before olddefconfig"
           grep -E 'CONFIG_(TCP_CONG_|DEFAULT_(BBR|CUBIC|RENO|TCP_CONG))' out/.config || true
           make $MAKE_ARGS olddefconfig
@@ -254,6 +352,18 @@ jobs:
           fi
           if [ "${{ inputs.mglru }}" = "true" ]; then
             grep -x 'CONFIG_LRU_GEN_ENABLED=y' out/.config
+          fi
+          if [ "${{ inputs.wild }}" = "true" ]; then
+            for c in BBG TCP_CONG_BBR3 TCP_CONG_WESTWOOD IP_SET NETFILTER_XT_SET NET_SCH_CAKE \
+                     IP_NF_TARGET_TTL CIFS TMPFS_XATTR TMPFS_POSIX_ACL FANOTIFY; do
+              grep -x "CONFIG_$c=y" out/.config
+            done
+            grep -E '^CONFIG_LSM=.*baseband_guard' out/.config
+          fi
+          if [ "${{ inputs.wild_extra }}" = "true" ]; then
+            for c in NOMOUNT SYSVIPC POSIX_MQUEUE IPC_NS PID_NS USER_NS; do
+              grep -x "CONFIG_$c=y" out/.config
+            done
           fi
           if [ "${{ inputs.root }}" = "ksun-susfs" ]; then
             grep -x 'CONFIG_KSU=y' out/.config
@@ -402,7 +512,7 @@ jobs:
           cat > anykernel.sh <<'EOF'
           ### AnyKernel3 script - Xiaomi 13 Ultra (ishtar), kernel Image only
           properties() { '
-          kernel.string=ishtar 5.15.211 custom build (KernelSU-Next + SUSFS + MGLRU, kernel Image only)
+          kernel.string=ishtar 5.15.211 custom build (KernelSU-Next + SUSFS + Wild set, kernel Image only)
           do.devicecheck=1
           do.modules=0
           do.systemless=0
