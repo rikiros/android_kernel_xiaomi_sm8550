@@ -44,11 +44,11 @@ on:
         type: boolean
         default: false
       wild:
-        description: "Wild Kernels feature set: SUSFS ptrace + unicode fixes, Baseband Guard, BBRv3, IP sets/firewall/qdisc/TTL, CIFS, tmpfs xattr/ACL, fanotify"
+        description: "Wild Kernels feature set: SUSFS ptrace + unicode fixes, Baseband Guard, BBRv3, IP sets/firewall/qdisc/TTL, CIFS, tmpfs xattr/ACL"
         type: boolean
         default: true
       wild_extra:
-        description: "Also NoMount VFS hooks and DroidSpaces container support (more invasive)"
+        description: "NoMount + DroidSpaces (known to fail the ABI gate on this device - leave off)"
         type: boolean
         default: false
       root:
@@ -250,15 +250,16 @@ jobs:
         with:
           kernel_version: "5.15"
 
-      - name: Misc configs (tmpfs xattr/ACL, fanotify, overlayfs, kallsyms)
+      # fanotify is left out on purpose: CONFIG_FANOTIFY adds two entries to
+      # enum ucount_type (include/linux/user_namespace.h), which resizes arrays in
+      # struct ucounts / user_namespace and changed the CRC of 6528 exported symbols.
+      - name: Misc configs (tmpfs xattr / POSIX ACL)
         if: inputs.wild
-        uses: ./.github/actions/misc
+        uses: ./.github/actions/set-kernel-config
         with:
-          version: android13-5.15
-          kernel_version: "5.15"
-          android_version: android13
-          sublevel: "211"
-          variant: Normal
+          config_list: |
+            CONFIG_TMPFS_XATTR=y
+            CONFIG_TMPFS_POSIX_ACL=y
 
       - name: DroidSpaces container support
         if: inputs.wild_extra
@@ -357,10 +358,11 @@ jobs:
           fi
           if [ "${{ inputs.wild }}" = "true" ]; then
             for c in BBG TCP_CONG_BBR3 TCP_CONG_WESTWOOD IP_SET NETFILTER_XT_SET NET_SCH_CAKE \
-                     IP_NF_TARGET_TTL CIFS TMPFS_XATTR TMPFS_POSIX_ACL FANOTIFY; do
+                     IP_NF_TARGET_TTL CIFS TMPFS_XATTR TMPFS_POSIX_ACL; do
               grep -x "CONFIG_$c=y" out/.config
             done
             grep -E '^CONFIG_LSM=.*baseband_guard' out/.config
+            grep -x '# CONFIG_FANOTIFY is not set' out/.config
           fi
           if [ "${{ inputs.wild_extra }}" = "true" ]; then
             for c in NOMOUNT SYSVIPC POSIX_MQUEUE IPC_NS PID_NS USER_NS; do
